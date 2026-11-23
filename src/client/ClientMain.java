@@ -1,19 +1,20 @@
 package client;
 
 import common.Bytes;
-import common.Chaves;
 import common.Mensagem;
 import common.Registo;
 import common.Tipos;
 import common.Trama;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
+import java.io.Console;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.security.KeyPair;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -25,14 +26,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
+//Threads:
+//main: le comandos do teclado e faz pedidos ao relay (um de cada vez);
+//leitora: le TODAS as tramas que chegam do relay. As respostas a pedidos
+//vao para a fila 'respostas'; as mensagens recebidas (ENTREGA) vao para a
+//thread 'trabalho', que as decifra (e pode precisar de pedir as chaves do
+//remetente ao relay, por isso nao pode ser a propria leitora a faze-lo).
 
- //Threads:
- //main: le comandos do teclado e faz pedidos ao relay (um de cada vez);
- //leitora: le TODAS as tramas que chegam do relay. As respostas a pedidos
- //vao para a fila 'respostas'; as mensagens recebidas (ENTREGA) vao para a
- //thread 'trabalho', que as decifra (e pode precisar de pedir as chaves do
- //remetente ao relay, por isso nao pode ser a propria leitora a faze-lo).
- 
 public class ClientMain {
 
     private static final DateTimeFormatter HORA =
@@ -48,10 +48,10 @@ public class ClientMain {
     // Contactos ja obtidos (nome -> registo verificado).
     private final ConcurrentHashMap<String, Registo> contactos = new ConcurrentHashMap<>();
 
-    private ClientMain(String nome, DataOutputStream out) throws Exception {
-        this.nome = nome;
-        this.parAssinatura = Chaves.gerarParAssinatura();
-        this.parAcordo = Chaves.gerarParAcordo();
+    private ClientMain(Identidade identidade, DataOutputStream out) {
+        this.nome = identidade.getNome();
+        this.parAssinatura = identidade.getAssinaturaEd25519();
+        this.parAcordo = identidade.getAcordoX25519();
         this.out = out;
     }
 
@@ -65,17 +65,39 @@ public class ClientMain {
         String host = args.length > 1 ? args[1] : "localhost";
         int porto = args.length > 2 ? Integer.parseInt(args[2]) : 5000;
 
+        char[] palavraPasse = lerPalavraPasse(nome);
+        Path ficheiroIdentidade = Path.of("dados", nome + ".id");
+        Identidade identidade = Identidade.carregarOuCriar(ficheiroIdentidade, nome, palavraPasse);
+
         try (Socket socket = new Socket(host, porto);
              DataInputStream in = new DataInputStream(socket.getInputStream());
              DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
 
-            ClientMain cliente = new ClientMain(nome, out);
+            ClientMain cliente = new ClientMain(identidade, out);
             cliente.iniciarLeitora(in);
             if (cliente.registar()) {
                 cliente.ciclo();
             }
             cliente.trabalho.shutdownNow();
         }
+    }
+
+    private static char[] lerPalavraPasse(String nome) throws IOException {
+        Console consola = System.console();
+        if (consola != null) {
+            char[] pass = consola.readPassword("Palavra-passe para '%s': ", nome);
+            if (pass == null) {
+                throw new IOException("Leitura de palavra-passe cancelada.");
+            }
+            return pass;
+        }
+        System.out.print("Palavra-passe para '" + nome + "': ");
+        BufferedReader br = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        String linha = br.readLine();
+        if (linha == null) {
+            throw new IOException("Leitura de palavra-passe cancelada.");
+        }
+        return linha.toCharArray();
     }
 
     // comunicacao com o relay

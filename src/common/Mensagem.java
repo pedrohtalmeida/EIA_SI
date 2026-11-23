@@ -8,29 +8,32 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.KeyPair;
-import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.util.Arrays;
 
 /*
- * Envelope de uma mensagem (cifrado ponta a ponta; o relay so o reencaminha).
+- Envelope de uma mensagem (cifrado ponta a ponta; o relay so o reencaminha).
  *
- * Formato:
- *   cabecalho = writeUTF(remetente) | writeUTF(destinatario) | writeLong(instante)
- *   envelope  = cabecalho | [len][iv] | [len][cifrado] | [len][assinatura]
+- Formato:
+-   cabecalho = writeUTF(remetente) | writeUTF(destinatario) | writeLong(instante)
+-   envelope  = cabecalho | [len][iv] | [len][cifrado] | [len][assinatura]
  *
- *   chave      = SHA-256(segredo X25519(remetente, destinatario) | "|rem|dest")
- *   cifrado    = AES-256-GCM(chave, iv, texto, AAD = cabecalho)
- *   assinatura = Ed25519(remetente, tudo o que vem antes dela)
+-   chave      = HKDF-SHA256(ikm = segredo X25519(remetente, destinatario),
+-                            salt = "EIA-SI-MSG-V1",
+-                            info = "msg|" + remetente + "->" + destinatario,
+-                            len = 32)
+-   cifrado    = AES-256-GCM(chave, iv, texto, AAD = cabecalho)
+-   assinatura = Ed25519(remetente, tudo o que vem antes dela)
  *
- * - Confidencialidade: so quem tem uma das privadas X25519 obtem a chave.
- * - Integridade: tag GCM (cobre texto e cabecalho) + assinatura.
- * - Autenticidade: assinatura Ed25519 do remetente.
+- - Confidencialidade: so quem tem uma das privadas X25519 obtem a chave.
+- - Integridade: tag GCM (cobre texto e cabecalho) + assinatura.
+- - Autenticidade: assinatura Ed25519 do remetente.
  */
 public final class Mensagem {
 
     private static final int MAX_CIFRADO = Trama.MAX_CORPO;
+    private static final byte[] SALT_MENSAGEM = "EIA-SI-MSG-V1".getBytes(StandardCharsets.UTF_8);
 
     public final String remetente;
     public final String destinatario;
@@ -65,8 +68,13 @@ public final class Mensagem {
         byte[] cabecalho = buffer.toByteArray();
 
         byte[] chave = derivarChave(meuAcordo, destino.chaveAcordo, remetente, destino.nome);
+        byte[] cifrado;
         byte[] iv = Cifra.novoIv();
-        byte[] cifrado = Cifra.cifrar(chave, iv, texto.getBytes(StandardCharsets.UTF_8), cabecalho);
+        try {
+            cifrado = Cifra.cifrar(chave, iv, texto.getBytes(StandardCharsets.UTF_8), cabecalho);
+        } finally {
+            Arrays.fill(chave, (byte) 0);
+        }
 
         Bytes.escrever(d, iv);
         Bytes.escrever(d, cifrado);
@@ -109,19 +117,26 @@ public final class Mensagem {
             throw new GeneralSecurityException("Assinatura da mensagem invalida");
         }
         byte[] chave = derivarChave(meuAcordo, registoRemetente.chaveAcordo, remetente, destinatario);
-        byte[] claro = Cifra.decifrar(chave, iv, cifrado, cabecalho);
+        byte[] claro;
+        try {
+            claro = Cifra.decifrar(chave, iv, cifrado, cabecalho);
+        } finally {
+            Arrays.fill(chave, (byte) 0);
+        }
         return new String(claro, StandardCharsets.UTF_8);
     }
 
     // Os dois lados calculam a mesma chave: X25519 da o mesmo segredo.
-    // O segredo do X25519 nao deve ser usado diretamente como chave AES, por isso
-    // passa por SHA-256 juntamente com a direcao (rem -> dest): cada sentido tem a sua chave.
+    // O segredo do X25519 passa por HKDF-SHA256 com o contexto direcional
+    // (remetente -> destinatario) para derivar uma chave AES-256 independente por sentido.
     private static byte[] derivarChave(PrivateKey meuAcordo, PublicKey acordoDoOutro,
                                        String remetente, String destinatario) throws GeneralSecurityException {
         byte[] segredo = Chaves.segredoPartilhado(meuAcordo, acordoDoOutro);
-        MessageDigest sha = MessageDigest.getInstance("SHA-256");
-        sha.update(segredo);
-        sha.update(("|" + remetente + "|" + destinatario).getBytes(StandardCharsets.UTF_8));
-        return sha.digest(); // 32 bytes -> AES-256
+        try {
+            String contexto = "msg|" + remetente + "->" + destinatario;
+            return Hkdf.derivar(segredo, SALT_MENSAGEM, contexto, 32); // 32 bytes -> AES-256
+        } finally {
+            Arrays.fill(segredo, (byte) 0);
+        }
     }
 }

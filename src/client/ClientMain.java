@@ -43,21 +43,23 @@ public class ClientMain {
     private final String nome;
     private final KeyPair parAssinatura; // Ed25519
     private final KeyPair parAcordo;     // X25519
+    private final Contactos gestorContactos;
     private final DataOutputStream out;
     private final BlockingQueue<Trama> respostas = new LinkedBlockingQueue<>();
     private final ExecutorService trabalho = Executors.newSingleThreadExecutor();
 
-    // Contactos ja obtidos (nome -> registo verificado).
+    // Contactos ja obtidos nesta sessao (nome -> registo verificado).
     private final ConcurrentHashMap<String, Registo> contactos = new ConcurrentHashMap<>();
 
     // Cadeias do Ratchet por contacto (Modulo B).
     private final ConcurrentHashMap<String, CadeiaChaves> cadeiasEnvio = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CadeiaChaves> cadeiasRececao = new ConcurrentHashMap<>();
 
-    private ClientMain(Identidade identidade, DataOutputStream out) {
+    private ClientMain(Identidade identidade, Contactos gestorContactos, DataOutputStream out) {
         this.nome = identidade.getNome();
         this.parAssinatura = identidade.getAssinaturaEd25519();
         this.parAcordo = identidade.getAcordoX25519();
+        this.gestorContactos = gestorContactos;
         this.out = out;
     }
 
@@ -75,16 +77,20 @@ public class ClientMain {
         Path ficheiroIdentidade = Path.of("dados", nome + ".id");
         Identidade identidade = Identidade.carregarOuCriar(ficheiroIdentidade, nome, palavraPasse);
 
+        Path ficheiroContactos = Path.of("dados", nome + ".contactos");
+        Contactos gestorContactos = Contactos.carregar(ficheiroContactos, identidade);
+
         try (Socket socket = new Socket(host, porto);
              DataInputStream in = new DataInputStream(socket.getInputStream());
              DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
 
-            ClientMain cliente = new ClientMain(identidade, out);
+            ClientMain cliente = new ClientMain(identidade, gestorContactos, out);
             cliente.iniciarLeitora(in);
             if (cliente.registar()) {
                 cliente.ciclo();
             }
             cliente.trabalho.shutdownNow();
+            gestorContactos.destruir();
         }
     }
 
@@ -142,14 +148,14 @@ public class ClientMain {
         Trama r = pedido(Tipos.REGISTO, corpo);
         if (r.tipo == Tipos.REGISTO_OK) {
             System.out.println("Registado como '" + nome + "'.");
-            System.out.println("Comandos: procurar <nome> | enviar <nome> <texto> | sair");
+            System.out.println("Comandos: procurar <nome> | verificar <nome> | enviar <nome> <texto> | sair");
             return true;
         }
         System.out.println("Registo recusado: " + texto(r));
         return false;
     }
 
-    // Descoberta: pede o registo ao relay e verifica-o localmente.
+    // Descoberta: pede o registo ao relay, verifica assinatura e aplica politica TOFU.
     private Registo obterContacto(String outro) throws Exception {
         Registo conhecido = contactos.get(outro);
         if (conhecido != null) {
@@ -163,6 +169,13 @@ public class ClientMain {
         if (!reg.nome.equals(outro)) {
             throw new IOException("O relay devolveu o registo de outro utilizador");
         }
+
+        boolean primeiraVez = gestorContactos.verificarOuRegistarTofu(reg);
+        if (primeiraVez) {
+            System.out.println("[TOFU] Contacto '" + outro + "' registado na primeira utilizacao. "
+                    + "Usa 'verificar " + outro + "' para confirmar o codigo fora de banda.");
+        }
+
         contactos.put(outro, reg);
         return reg;
     }
@@ -235,13 +248,19 @@ public class ClientMain {
                         Registo reg = obterContacto(partes[1]);
                         System.out.println(reg.nome + " encontrado (registo com assinatura valida).");
                     }
+                    case "verificar" -> {
+                        if (partes.length < 2) { System.out.println("Uso: verificar <nome>"); break; }
+                        Registo reg = obterContacto(partes[1]);
+                        String codigo = gestorContactos.obterCodigoVerificacao(reg.nome);
+                        System.out.println("Codigo de verificacao de '" + reg.nome + "': " + codigo);
+                    }
                     case "enviar" -> {
                         if (partes.length < 3) { System.out.println("Uso: enviar <nome> <texto>"); break; }
                         enviar(partes[1], partes[2]);
                     }
                     case "sair" -> { return; }
                     case "" -> { }
-                    default -> System.out.println("Comandos: procurar <nome> | enviar <nome> <texto> | sair");
+                    default -> System.out.println("Comandos: procurar <nome> | verificar <nome> | enviar <nome> <texto> | sair");
                 }
             } catch (Exception e) {
                 System.out.println("Erro: " + e.getMessage());

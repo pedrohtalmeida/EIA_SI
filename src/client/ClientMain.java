@@ -152,7 +152,8 @@ public class ClientMain {
 
         Trama r = pedido(Tipos.ENVIAR, buffer.toByteArray());
         if (r.tipo == Tipos.ENVIAR_OK) {
-            System.out.println("[enviada para " + destino + "]");
+            // "entregue" (destinatario ligado) ou "guardada" (fica no relay ate ele a levantar)
+            System.out.println("[" + texto(r) + " para " + destino + "]");
         } else {
             System.out.println("Nao enviada: " + texto(r));
         }

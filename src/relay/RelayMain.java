@@ -25,39 +25,21 @@ public class RelayMain {
     // nome -> registo (chaves publicas). Partilhado por todas as threads.
     private static final ConcurrentHashMap<String, Registo> utilizadores = new ConcurrentHashMap<>();
 
-    // nome -> ligacao do cliente que esta ligado neste momento.
-    private static final ConcurrentHashMap<String, Ligacao> ligados = new ConcurrentHashMap<>();
+    // Ligacao ativa de cada utilizador + mensagens pendentes (armazenamento diferido).
+    private static final Pendentes pendentes = new Pendentes();
 
-    /*
-     * Envolve o fluxo de saida de um cliente. 'synchronized' porque varias threads
-     * podem escrever para o mesmo cliente ao mesmo tempo (a dele, ao responder,
-     * e a de outro cliente, ao entregar-lhe uma mensagem). Sem isto, os bytes de
-     * duas tramas podiam ficar misturados.
-     */
-    static final class Ligacao {
-        private final DataOutputStream out;
-
-        Ligacao(DataOutputStream out) {
-            this.out = out;
-        }
-
-        synchronized void enviar(byte tipo, byte[] corpo) throws IOException {
-            Trama.escrever(out, tipo, corpo);
-        }
-
-        void erro(String mensagem) throws IOException {
-            enviar(Tipos.ERRO, mensagem.getBytes(StandardCharsets.UTF_8));
-        }
-    }
-
-    public static void main(String[] args) throws IOException {
+   public static void main(String[] args) throws IOException {
         int porto = args.length > 0 ? Integer.parseInt(args[0]) : PORTO_PREDEFINIDO;
         try (ServerSocket servidor = new ServerSocket(porto)) {
             System.out.println("Relay a escutar no porto " + porto);
-            while (true) {
-                Socket socket = servidor.accept();
-                new Thread(() -> atender(socket)).start(); // uma thread por cliente
-            }
+            servir(servidor);
+        }
+    }
+    // Separado do main para os testes poderem arrancar um relay num porto livre.
+    public static void servir(ServerSocket servidor) throws IOException {
+        while (true) {
+            Socket socket = servidor.accept();
+            new Thread(() -> atender(socket)).start(); // uma thread por cliente
         }
     }
 
@@ -97,7 +79,7 @@ public class RelayMain {
             // normal quando o cliente se desliga (ou envia uma trama mal formada)
         } finally {
             if (meuNome != null) {
-                ligados.remove(meuNome, lig); // so remove se ainda for esta ligacao
+                pendentes.desligar(meuNome, lig); // a partir daqui, as mensagens para ele sao guardadas
             }
             System.out.println("Cliente desligado: " + origem + (meuNome != null ? " (" + meuNome + ")" : ""));
         }
@@ -129,7 +111,7 @@ public class RelayMain {
             return null;
         }
 
-        ligados.put(novo.nome, lig); // se ja estava ligado noutra ligacao, esta passa a ser a ativa
+        pendentes.ligar(novo.nome, lig); // se ja estava ligado noutra ligacao, esta passa a ser a ativa
         System.out.println("Registado: " + novo.nome);
         lig.enviar(Tipos.REGISTO_OK, new byte[0]);
         return novo.nome;
@@ -159,19 +141,26 @@ public class RelayMain {
             return;
         }
 
-        Ligacao ligDestino = ligados.get(destino);
-        if (ligDestino == null) {
-            lig.erro("Destinatario desligado: " + destino);
+        // So se guardam mensagens para utilizadores registados.
+        if (!utilizadores.containsKey(destino)) {
+            lig.erro("Utilizador desconhecido: " + destino);
             return;
         }
-        try {
-            ligDestino.enviar(Tipos.ENTREGA, envelope); // o relay nao consegue ler o envelope
-        } catch (IOException e) {
-            lig.erro("Falha ao entregar a " + destino);
-            return;
+
+        // Ligado: entrega ja. Desligado: guarda (o relay nao consegue ler o envelope).
+        switch (pendentes.entregarOuGuardar(destino, envelope)) {
+            case ENTREGUE -> {
+                System.out.println("Entregue " + remetente + " -> " + destino
+                        + " (" + envelope.length + " bytes cifrados)");
+                lig.enviar(Tipos.ENVIAR_OK, "entregue".getBytes(StandardCharsets.UTF_8));
+            }
+            case GUARDADA -> {
+                System.out.println("Guardada " + remetente + " -> " + destino + " (" + envelope.length
+                        + " bytes cifrados; " + pendentes.quantas(destino) + " pendentes)");
+                lig.enviar(Tipos.ENVIAR_OK, "guardada".getBytes(StandardCharsets.UTF_8));
+            }
+            case CAIXA_CHEIA -> lig.erro("Caixa de " + destino + " cheia: mensagem recusada");
         }
-        System.out.println("Reencaminhada mensagem " + remetente + " -> " + destino
-                + " (" + envelope.length + " bytes cifrados)");
-        lig.enviar(Tipos.ENVIAR_OK, new byte[0]);
+        
     }
 }

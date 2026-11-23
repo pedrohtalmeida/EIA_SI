@@ -9,35 +9,29 @@ import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.KeyPair;
 import java.security.PrivateKey;
-import java.security.PublicKey;
 import java.util.Arrays;
 
 /*
-- Envelope de uma mensagem (cifrado ponta a ponta; o relay so o reencaminha).
+ * Envelope de uma mensagem (cifrado ponta a ponta com Ratchet simétrico - Módulo B).
  *
-- Formato:
--   cabecalho = writeUTF(remetente) | writeUTF(destinatario) | writeLong(instante)
--   envelope  = cabecalho | [len][iv] | [len][cifrado] | [len][assinatura]
+ * Formato:
+ *   cabecalho = writeUTF(remetente) | writeUTF(destinatario) | writeLong(instante)
+ *             | writeLong(idSessao) | writeLong(contador)
+ *   envelope  = cabecalho | [len][iv] | [len][cifrado] | [len][assinatura]
  *
--   chave      = HKDF-SHA256(ikm = segredo X25519(remetente, destinatario),
--                            salt = "EIA-SI-MSG-V1",
--                            info = "msg|" + remetente + "->" + destinatario,
--                            len = 32)
--   cifrado    = AES-256-GCM(chave, iv, texto, AAD = cabecalho)
--   assinatura = Ed25519(remetente, tudo o que vem antes dela)
- *
-- - Confidencialidade: so quem tem uma das privadas X25519 obtem a chave.
-- - Integridade: tag GCM (cobre texto e cabecalho) + assinatura.
-- - Autenticidade: assinatura Ed25519 do remetente.
+ *   chave      = MK_contador derivada da CadeiaChaves (ECDH X25519 + HKDF-SHA256)
+ *   cifrado    = AES-256-GCM(chave, iv, texto, AAD = cabecalho)
+ *   assinatura = Ed25519(remetente, tudo o que vem antes dela)
  */
 public final class Mensagem {
 
     private static final int MAX_CIFRADO = Trama.MAX_CORPO;
-    private static final byte[] SALT_MENSAGEM = "EIA-SI-MSG-V1".getBytes(StandardCharsets.UTF_8);
 
     public final String remetente;
     public final String destinatario;
     public final long instante;
+    public final long idSessao;
+    public final long contador;
 
     private final byte[] cabecalho;
     private final byte[] iv;
@@ -45,11 +39,13 @@ public final class Mensagem {
     private final byte[] assinados;
     private final byte[] assinatura;
 
-    private Mensagem(String remetente, String destinatario, long instante, byte[] cabecalho,
-                     byte[] iv, byte[] cifrado, byte[] assinados, byte[] assinatura) {
+    private Mensagem(String remetente, String destinatario, long instante, long idSessao, long contador,
+                     byte[] cabecalho, byte[] iv, byte[] cifrado, byte[] assinados, byte[] assinatura) {
         this.remetente = remetente;
         this.destinatario = destinatario;
         this.instante = instante;
+        this.idSessao = idSessao;
+        this.contador = contador;
         this.cabecalho = cabecalho;
         this.iv = iv;
         this.cifrado = cifrado;
@@ -57,38 +53,52 @@ public final class Mensagem {
         this.assinatura = assinatura;
     }
 
-    // Remetente: cifra e assina. Devolve os bytes do envelope.
-    public static byte[] selar(String remetente, KeyPair minhaAssinatura, PrivateKey meuAcordo,
+    // Remetente: avança a cadeia de envio, cifra e assina. Devolve os bytes do envelope.
+    public static byte[] selar(String remetente, KeyPair minhaAssinatura, CadeiaChaves cadeiaEnvio,
                                Registo destino, String texto) throws IOException, GeneralSecurityException {
-        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-        DataOutputStream d = new DataOutputStream(buffer);
-        d.writeUTF(remetente);
-        d.writeUTF(destino.nome);
-        d.writeLong(System.currentTimeMillis());
-        byte[] cabecalho = buffer.toByteArray();
-
-        byte[] chave = derivarChave(meuAcordo, destino.chaveAcordo, remetente, destino.nome);
-        byte[] cifrado;
-        byte[] iv = Cifra.novoIv();
+        CadeiaChaves.PassoEnvio passo = cadeiaEnvio.avancarParaEnvio();
         try {
-            cifrado = Cifra.cifrar(chave, iv, texto.getBytes(StandardCharsets.UTF_8), cabecalho);
-        } finally {
-            Arrays.fill(chave, (byte) 0);
-        }
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            DataOutputStream d = new DataOutputStream(buffer);
+            d.writeUTF(remetente);
+            d.writeUTF(destino.nome);
+            d.writeLong(System.currentTimeMillis());
+            d.writeLong(passo.idSessao);
+            d.writeLong(passo.contador);
+            byte[] cabecalho = buffer.toByteArray();
 
-        Bytes.escrever(d, iv);
-        Bytes.escrever(d, cifrado);
-        byte[] assinados = buffer.toByteArray();
-        Bytes.escrever(d, Chaves.assinar(minhaAssinatura.getPrivate(), assinados));
-        return buffer.toByteArray();
+            byte[] iv = Cifra.novoIv();
+            byte[] cifrado = Cifra.cifrar(passo.chaveMensagem, iv, texto.getBytes(StandardCharsets.UTF_8), cabecalho);
+
+            Bytes.escrever(d, iv);
+            Bytes.escrever(d, cifrado);
+            byte[] assinados = buffer.toByteArray();
+            Bytes.escrever(d, Chaves.assinar(minhaAssinatura.getPrivate(), assinados));
+            return buffer.toByteArray();
+        } finally {
+            Arrays.fill(passo.chaveMensagem, (byte) 0);
+        }
     }
 
-    // Destinatario, passo 1: le o envelope (ainda sem verificar nada), para saber quem o enviou.
+    // Sobrecarga de compatibilidade para testes que passam diretamente a PrivateKey X25519.
+    public static byte[] selar(String remetente, KeyPair minhaAssinatura, PrivateKey meuAcordo,
+                               Registo destino, String texto) throws IOException, GeneralSecurityException {
+        CadeiaChaves cadeia = CadeiaChaves.criarParaEnvio(meuAcordo, destino.chaveAcordo, remetente, destino.nome);
+        try {
+            return selar(remetente, minhaAssinatura, cadeia, destino, texto);
+        } finally {
+            cadeia.destruir();
+        }
+    }
+
+    // Destinatário, passo 1: lê o envelope (ainda sem verificar nada), para saber quem o enviou e qual a sessão.
     public static Mensagem ler(byte[] envelope) throws IOException {
         DataInputStream d = new DataInputStream(new ByteArrayInputStream(envelope));
         String remetente = d.readUTF();
         String destinatario = d.readUTF();
         long instante = d.readLong();
+        long idSessao = d.readLong();
+        long contador = d.readLong();
         byte[] cabecalho = Arrays.copyOf(envelope, envelope.length - d.available());
 
         byte[] iv = Bytes.ler(d, Cifra.TAM_IV);
@@ -101,11 +111,12 @@ public final class Mensagem {
         if (d.available() != 0) {
             throw new IOException("Bytes a mais no envelope");
         }
-        return new Mensagem(remetente, destinatario, instante, cabecalho, iv, cifrado, assinados, assinatura);
+        return new Mensagem(remetente, destinatario, instante, idSessao, contador,
+                cabecalho, iv, cifrado, assinados, assinatura);
     }
 
-    // Destinatario, passo 2: verifica a assinatura e decifra. Lanca excecao se algo falhar.
-    public String abrir(String meuNome, PrivateKey meuAcordo, Registo registoRemetente)
+    // Destinatário, passo 2: verifica a assinatura, obtém a chave da cadeia (tratando fora de ordem/repetição) e decifra.
+    public String abrir(String meuNome, CadeiaChaves cadeiaRececao, Registo registoRemetente)
             throws GeneralSecurityException {
         if (!destinatario.equals(meuNome)) {
             throw new GeneralSecurityException("Mensagem nao e para mim");
@@ -113,30 +124,31 @@ public final class Mensagem {
         if (!registoRemetente.nome.equals(remetente)) {
             throw new GeneralSecurityException("Registo nao corresponde ao remetente");
         }
+        if (cadeiaRececao.getIdSessao() != idSessao) {
+            throw new GeneralSecurityException("ID de sessao da cadeia nao corresponde a mensagem");
+        }
         if (!Chaves.verificar(registoRemetente.chaveAssinatura, assinados, assinatura)) {
             throw new GeneralSecurityException("Assinatura da mensagem invalida");
         }
-        byte[] chave = derivarChave(meuAcordo, registoRemetente.chaveAcordo, remetente, destinatario);
-        byte[] claro;
+
+        byte[] chave = cadeiaRececao.obterChaveParaRececao(contador);
         try {
-            claro = Cifra.decifrar(chave, iv, cifrado, cabecalho);
+            byte[] claro = Cifra.decifrar(chave, iv, cifrado, cabecalho);
+            return new String(claro, StandardCharsets.UTF_8);
         } finally {
             Arrays.fill(chave, (byte) 0);
         }
-        return new String(claro, StandardCharsets.UTF_8);
     }
 
-    // Os dois lados calculam a mesma chave: X25519 da o mesmo segredo.
-    // O segredo do X25519 passa por HKDF-SHA256 com o contexto direcional
-    // (remetente -> destinatario) para derivar uma chave AES-256 independente por sentido.
-    private static byte[] derivarChave(PrivateKey meuAcordo, PublicKey acordoDoOutro,
-                                       String remetente, String destinatario) throws GeneralSecurityException {
-        byte[] segredo = Chaves.segredoPartilhado(meuAcordo, acordoDoOutro);
+    // Sobrecarga de compatibilidade para testes que passam diretamente a PrivateKey X25519.
+    public String abrir(String meuNome, PrivateKey meuAcordo, Registo registoRemetente)
+            throws GeneralSecurityException {
+        CadeiaChaves cadeia = CadeiaChaves.criarComSessao(
+                idSessao, meuAcordo, registoRemetente.chaveAcordo, remetente, meuNome);
         try {
-            String contexto = "msg|" + remetente + "->" + destinatario;
-            return Hkdf.derivar(segredo, SALT_MENSAGEM, contexto, 32); // 32 bytes -> AES-256
+            return abrir(meuNome, cadeia, registoRemetente);
         } finally {
-            Arrays.fill(segredo, (byte) 0);
+            cadeia.destruir();
         }
     }
 }

@@ -1,6 +1,7 @@
 package client;
 
 import common.Bytes;
+import common.CadeiaChaves;
 import common.Mensagem;
 import common.Registo;
 import common.Tipos;
@@ -15,6 +16,7 @@ import java.io.InputStreamReader;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.security.GeneralSecurityException;
 import java.security.KeyPair;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -47,6 +49,10 @@ public class ClientMain {
 
     // Contactos ja obtidos (nome -> registo verificado).
     private final ConcurrentHashMap<String, Registo> contactos = new ConcurrentHashMap<>();
+
+    // Cadeias do Ratchet por contacto (Modulo B).
+    private final ConcurrentHashMap<String, CadeiaChaves> cadeiasEnvio = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, CadeiaChaves> cadeiasRececao = new ConcurrentHashMap<>();
 
     private ClientMain(Identidade identidade, DataOutputStream out) {
         this.nome = identidade.getNome();
@@ -102,8 +108,6 @@ public class ClientMain {
 
     // comunicacao com o relay
 
-    // Envia um pedido e espera pela resposta. 'synchronized' garante um pedido de
-    // cada vez, por isso a resposta que chega e sempre a deste pedido.
     private synchronized Trama pedido(byte tipo, byte[] corpo) throws IOException, InterruptedException {
         Trama.escrever(out, tipo, corpo);
         Trama resposta = respostas.poll(10, TimeUnit.SECONDS);
@@ -155,7 +159,7 @@ public class ClientMain {
         if (r.tipo != Tipos.PROCURAR_RESP) {
             throw new IOException(texto(r));
         }
-        Registo reg = Registo.ler(r.corpo); // verifica a auto-assinatura (nao confia no relay)
+        Registo reg = Registo.ler(r.corpo);
         if (!reg.nome.equals(outro)) {
             throw new IOException("O relay devolveu o registo de outro utilizador");
         }
@@ -163,9 +167,32 @@ public class ClientMain {
         return reg;
     }
 
+    private CadeiaChaves obterCadeiaEnvio(Registo destino) throws GeneralSecurityException {
+        CadeiaChaves cadeia = cadeiasEnvio.get(destino.nome);
+        if (cadeia == null) {
+            cadeia = CadeiaChaves.criarParaEnvio(parAcordo.getPrivate(), destino.chaveAcordo, nome, destino.nome);
+            cadeiasEnvio.put(destino.nome, cadeia);
+        }
+        return cadeia;
+    }
+
+    private CadeiaChaves obterCadeiaRececao(Registo remetente, long idSessao) throws GeneralSecurityException {
+        CadeiaChaves cadeia = cadeiasRececao.get(remetente.nome);
+        if (cadeia == null || cadeia.getIdSessao() != idSessao) {
+            if (cadeia != null) {
+                cadeia.destruir();
+            }
+            cadeia = CadeiaChaves.criarComSessao(
+                    idSessao, parAcordo.getPrivate(), remetente.chaveAcordo, remetente.nome, nome);
+            cadeiasRececao.put(remetente.nome, cadeia);
+        }
+        return cadeia;
+    }
+
     private void enviar(String destino, String texto) throws Exception {
         Registo reg = obterContacto(destino);
-        byte[] envelope = Mensagem.selar(nome, parAssinatura, parAcordo.getPrivate(), reg, texto);
+        CadeiaChaves cadeia = obterCadeiaEnvio(reg);
+        byte[] envelope = Mensagem.selar(nome, parAssinatura, cadeia, reg, texto);
 
         ByteArrayOutputStream buffer = new ByteArrayOutputStream();
         DataOutputStream d = new DataOutputStream(buffer);
@@ -174,7 +201,6 @@ public class ClientMain {
 
         Trama r = pedido(Tipos.ENVIAR, buffer.toByteArray());
         if (r.tipo == Tipos.ENVIAR_OK) {
-            // "entregue" (destinatario ligado) ou "guardada" (fica no relay ate ele a levantar)
             System.out.println("[" + texto(r) + " para " + destino + "]");
         } else {
             System.out.println("Nao enviada: " + texto(r));
@@ -186,7 +212,8 @@ public class ClientMain {
         try {
             Mensagem m = Mensagem.ler(envelope);
             Registo reg = obterContacto(m.remetente);
-            String texto = m.abrir(nome, parAcordo.getPrivate(), reg);
+            CadeiaChaves cadeia = obterCadeiaRececao(reg, m.idSessao);
+            String texto = m.abrir(nome, cadeia, reg);
             System.out.println("[" + HORA.format(Instant.ofEpochMilli(m.instante)) + "] "
                     + m.remetente + ": " + texto);
         } catch (Exception e) {

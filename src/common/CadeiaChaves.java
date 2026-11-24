@@ -1,5 +1,10 @@
 package common;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
@@ -150,6 +155,57 @@ public final class CadeiaChaves {
 
         proximoContador++;
         return mk;
+    }
+
+    /**
+     * Serializa o estado da cadeia (para guardar em ficheiro cifrado).
+     * Formato: idSessao | proximoContador | CK (32 bytes) | n | n x (contador | MK, 32 bytes)
+     */
+    public synchronized byte[] serializar() throws IOException {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        DataOutputStream d = new DataOutputStream(buffer);
+        d.writeLong(idSessao);
+        d.writeLong(proximoContador);
+        d.write(chaveCadeia);
+        d.writeInt(chavesSaltadas.size());
+        for (Map.Entry<Long, byte[]> e : chavesSaltadas.entrySet()) {
+            d.writeLong(e.getKey());
+            d.write(e.getValue());
+        }
+        return buffer.toByteArray();
+    }
+
+    /**
+     * Reconstroi uma cadeia a partir dos bytes de serializar(), validando tudo o que le.
+     */
+    public static CadeiaChaves desserializar(byte[] dados) throws IOException {
+        DataInputStream d = new DataInputStream(new ByteArrayInputStream(dados));
+        long idSessao = d.readLong();
+        long proximo = d.readLong();
+        if (proximo < 0) {
+            throw new IOException("Contador invalido no estado da cadeia");
+        }
+        byte[] ck = new byte[TAMANHO_CHAVE];
+        d.readFully(ck);
+        int n = d.readInt();
+        if (n < 0 || n > LIMITE_SALTADAS) {
+            throw new IOException("Numero de chaves saltadas invalido");
+        }
+        CadeiaChaves cadeia = new CadeiaChaves(idSessao, ck);
+        cadeia.proximoContador = proximo;
+        for (int i = 0; i < n; i++) {
+            long contador = d.readLong();
+            if (contador < 0 || contador >= proximo) {
+                throw new IOException("Chave saltada com contador invalido");
+            }
+            byte[] mk = new byte[TAMANHO_CHAVE];
+            d.readFully(mk);
+            cadeia.chavesSaltadas.put(contador, mk);
+        }
+        if (d.available() != 0) {
+            throw new IOException("Bytes a mais no estado da cadeia");
+        }
+        return cadeia;
     }
 
     /**

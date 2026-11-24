@@ -53,13 +53,15 @@ public class ClientMain {
 
     // Cadeias do Ratchet por contacto (Modulo B).
     private final ConcurrentHashMap<String, CadeiaChaves> cadeiasEnvio = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, CadeiaChaves> cadeiasRececao = new ConcurrentHashMap<>();
+    private final GestorCadeias cadeiasRececao; // uma cadeia por (remetente, sessao), guardada em ficheiro
 
-    private ClientMain(Identidade identidade, Contactos gestorContactos, DataOutputStream out) {
+    private ClientMain(Identidade identidade, Contactos gestorContactos, GestorCadeias cadeiasRececao,
+                       DataOutputStream out) {
         this.nome = identidade.getNome();
         this.parAssinatura = identidade.getAssinaturaEd25519();
         this.parAcordo = identidade.getAcordoX25519();
         this.gestorContactos = gestorContactos;
+        this.cadeiasRececao = cadeiasRececao;
         this.out = out;
     }
 
@@ -80,11 +82,14 @@ public class ClientMain {
         Path ficheiroContactos = Path.of("dados", nome + ".contactos");
         Contactos gestorContactos = Contactos.carregar(ficheiroContactos, identidade);
 
+        Path ficheiroCadeias = Path.of("dados", nome + ".cadeias");
+        GestorCadeias cadeiasRececao = GestorCadeias.carregar(ficheiroCadeias, identidade);
+
         try (Socket socket = new Socket(host, porto);
              DataInputStream in = new DataInputStream(socket.getInputStream());
              DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
 
-            ClientMain cliente = new ClientMain(identidade, gestorContactos, out);
+            ClientMain cliente = new ClientMain(identidade, gestorContactos, cadeiasRececao, out);
             cliente.iniciarLeitora(in);
             if (cliente.registar()) {
                 cliente.ciclo();
@@ -190,16 +195,7 @@ public class ClientMain {
     }
 
     private CadeiaChaves obterCadeiaRececao(Registo remetente, long idSessao) throws GeneralSecurityException {
-        CadeiaChaves cadeia = cadeiasRececao.get(remetente.nome);
-        if (cadeia == null || cadeia.getIdSessao() != idSessao) {
-            if (cadeia != null) {
-                cadeia.destruir();
-            }
-            cadeia = CadeiaChaves.criarComSessao(
-                    idSessao, parAcordo.getPrivate(), remetente.chaveAcordo, remetente.nome, nome);
-            cadeiasRececao.put(remetente.nome, cadeia);
-        }
-        return cadeia;
+        return cadeiasRececao.obter(remetente, idSessao, parAcordo.getPrivate(), nome);
     }
 
     private void enviar(String destino, String texto) throws Exception {
@@ -226,7 +222,12 @@ public class ClientMain {
             Mensagem m = Mensagem.ler(envelope);
             Registo reg = obterContacto(m.remetente);
             CadeiaChaves cadeia = obterCadeiaRececao(reg, m.idSessao);
-            String texto = m.abrir(nome, cadeia, reg);
+            String texto;
+            try {
+                texto = m.abrir(nome, cadeia, reg);
+            } finally {
+                cadeiasRececao.guardar(); // o estado avancou: grava-o para sobreviver a reinicios
+            }
             System.out.println("[" + HORA.format(Instant.ofEpochMilli(m.instante)) + "] "
                     + m.remetente + ": " + texto);
         } catch (Exception e) {

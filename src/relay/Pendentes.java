@@ -117,6 +117,17 @@ public final class Pendentes {
         }
     }
 
+    // Entrega as pendentes e marca a ligacao como ativa, tudo com o mesmo lock:
+    // assim nenhuma mensagem nova passa a frente das antigas nem fica esquecida na fila.
+    public int ligarEEntregar(String nome, Ligacao lig) throws IOException {
+        Caixa c = caixa(nome);
+        synchronized (c) {
+            int entregues = entregarPendentes(nome, lig);
+            c.ligacao = lig;
+            return entregues;
+        }
+    }
+
     // Numero de mensagens guardadas para um utilizador.
     public int quantas(String nome) {
         Caixa c = caixas.get(nome);

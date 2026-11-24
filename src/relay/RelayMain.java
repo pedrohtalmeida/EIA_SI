@@ -1,6 +1,7 @@
 package relay;
 
 import common.Bytes;
+import common.Levantamento;
 import common.Registo;
 import common.Tipos;
 import common.Trama;
@@ -10,9 +11,12 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
+
 
 /*
  * Relay: regista utilizadores, responde a pedidos de descoberta e reencaminha
@@ -27,6 +31,11 @@ public class RelayMain {
 
     // Ligacao ativa de cada utilizador + mensagens pendentes (armazenamento diferido).
     private static final Pendentes pendentes = new Pendentes();
+
+    
+    // Modulo C: desafios do levantamento, validos durante 30 segundos.
+    public static final long VALIDADE_DESAFIO_MS = 30_000;
+    private static final Desafios desafios = new Desafios(VALIDADE_DESAFIO_MS);
 
    public static void main(String[] args) throws IOException {
         int porto = args.length > 0 ? Integer.parseInt(args[0]) : PORTO_PREDEFINIDO;
@@ -57,22 +66,23 @@ public class RelayMain {
             while (true) {
                 Trama trama = Trama.ler(in);
                 switch (trama.tipo) {
-                    case Tipos.REGISTO -> {
-                        if (meuNome != null) {
-                            lig.erro("Esta ligacao ja esta registada como " + meuNome);
-                        } else {
-                            meuNome = registar(trama.corpo, lig);
+                    case Tipos.REGISTO -> registar(trama.corpo, lig);
+                    case Tipos.PROCURAR -> procurar(trama.corpo, lig);
+                    case Tipos.LEVANTAR -> pedirDesafio(trama.corpo, lig, meuNome);
+                    case Tipos.RESPOSTA -> {
+                        String nome = responderDesafio(trama.corpo, lig);
+                        if (nome != null) {
+                            meuNome = nome; // so agora a ligacao fica associada ao nome
                         }
                     }
-                    case Tipos.PROCURAR -> procurar(trama.corpo, lig);
                     case Tipos.ENVIAR -> {
                         if (meuNome == null) {
-                            lig.erro("Tem de se registar primeiro");
+                            lig.erro("Tem de se autenticar primeiro (levantar)");
                         } else {
                             reencaminhar(meuNome, trama.corpo, lig);
                         }
                     }
-                    default -> lig.erro("Tipo de trama desconhecido: " + trama.tipo);
+                    default -> lig.erro("Tipo de trama desconhecido: " + trama.tipo);                                        
                 }
             }
         } catch (IOException e) {
@@ -81,18 +91,24 @@ public class RelayMain {
             if (meuNome != null) {
                 pendentes.desligar(meuNome, lig); // a partir daqui, as mensagens para ele sao guardadas
             }
+            if (lig != null) {
+                desafios.esquecer(lig); // um desafio por responder desta ligacao deixa de valer
+            }            
             System.out.println("Cliente desligado: " + origem + (meuNome != null ? " (" + meuNome + ")" : ""));
         }
     }
 
-    // Devolve o nome registado, ou null se o registo foi recusado.
-    private static String registar(byte[] corpo, Ligacao lig) throws IOException {
+
+    // O registo so publica as chaves publicas: NAO associa a ligacao ao nome.
+    // A trama de registo nao tem nada de secreto e qualquer pessoa a podia repetir;
+    // a ligacao so fica associada ao nome depois do desafio-resposta (modulo C).
+    private static void registar(byte[] corpo, Ligacao lig) throws IOException {
         Registo novo;
         try {
             novo = Registo.ler(corpo); // valida o formato e verifica a assinatura
         } catch (Exception e) {
             lig.erro("Registo invalido: " + e.getMessage());
-            return null;
+            return;
         }
 
         // Verificar-e-inserir numa so operacao atomica: evita que duas threads
@@ -108,13 +124,46 @@ public class RelayMain {
         });
         if (recusado[0]) {
             lig.erro("Nome ja registado com outra chave");
-            return null;
+            return;
         }
 
-        pendentes.ligar(novo.nome, lig); // se ja estava ligado noutra ligacao, esta passa a ser a ativa
         System.out.println("Registado: " + novo.nome);
         lig.enviar(Tipos.REGISTO_OK, new byte[0]);
-        return novo.nome;
+    }
+    
+
+    // modulo C: levantamento por desafio-resposta 
+    
+    private static void pedirDesafio(byte[] corpo, Ligacao lig, String autenticado) throws IOException {
+        String nome = new String(corpo, StandardCharsets.UTF_8);
+        if (autenticado != null && !autenticado.equals(nome)) {
+            lig.erro("Esta ligacao ja esta autenticada como " + autenticado);
+            return;
+        }
+        if (!utilizadores.containsKey(nome)) {
+            lig.erro("Utilizador desconhecido: " + nome);
+            return;
+        }
+        lig.enviar(Tipos.DESAFIO, desafios.novo(lig, nome));
+    }
+
+    // Devolve o nome autenticado, ou null se a resposta foi recusada.
+    private static String responderDesafio(byte[] corpo, Ligacao lig) throws IOException {
+        String nome;
+        try {
+            byte[][] r = Levantamento.lerResposta(corpo);
+            nome = desafios.verificar(lig, r[0], r[1], utilizadores::get);
+        } catch (IOException | GeneralSecurityException e) {
+            desafios.esquecer(lig); // uma resposta mal formada tambem gasta o desafio
+            System.out.println("Levantamento recusado: " + e.getMessage());
+            lig.erro("Levantamento recusado: " + e.getMessage());
+            return null;
+        }
+        // Provado quem e: entrega as pendentes e passa a receber as novas em direto.
+        int entregues = pendentes.ligarEEntregar(nome, lig);
+        System.out.println("Autenticado: " + nome + " (" + entregues + " pendentes entregues)");
+        lig.enviar(Tipos.LEVANTAR_OK, ByteBuffer.allocate(4).putInt(entregues).array());
+        return nome;
     }
 
     private static void procurar(byte[] corpo, Ligacao lig) throws IOException {

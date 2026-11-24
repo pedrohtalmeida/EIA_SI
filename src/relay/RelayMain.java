@@ -1,5 +1,6 @@
 package relay;
 
+
 import common.Bytes;
 import common.Levantamento;
 import common.Registo;
@@ -11,11 +12,14 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
+
 
 
 /*
@@ -37,6 +41,13 @@ public class RelayMain {
     public static final long VALIDADE_DESAFIO_MS = 30_000;
     private static final Desafios desafios = new Desafios(VALIDADE_DESAFIO_MS);
 
+    // A4 - Robustez (disponibilidade). Os valores podem ser mudados com -D na linha
+    // de comandos (ex.: java -Drelay.maxLigacoes=50 ...); os testes usam valores pequenos.
+    public static final int MAX_LIGACOES = Integer.getInteger("relay.maxLigacoes", 100);
+    public static final long TEMPO_TRAMA_MS = Long.getLong("relay.tempoTramaMs", 10_000);
+    public static final long TEMPO_AUTENTICACAO_MS = Long.getLong("relay.tempoAutenticacaoMs", 30_000);
+    private static final Semaphore vagas = new Semaphore(MAX_LIGACOES);
+
    public static void main(String[] args) throws IOException {
         int porto = args.length > 0 ? Integer.parseInt(args[0]) : PORTO_PREDEFINIDO;
         try (ServerSocket servidor = new ServerSocket(porto)) {
@@ -44,13 +55,52 @@ public class RelayMain {
             servir(servidor);
         }
     }
+   
     // Separado do main para os testes poderem arrancar um relay num porto livre.
+    // A4: no maximo MAX_LIGACOES ligacoes ao mesmo tempo; as que passam do limite sao fechadas logo.
     public static void servir(ServerSocket servidor) throws IOException {
         while (true) {
             Socket socket = servidor.accept();
-            new Thread(() -> atender(socket)).start(); // uma thread por cliente
+            if (!vagas.tryAcquire()) {
+                System.out.println("Ligacao recusada (limite de " + MAX_LIGACOES + " ligacoes): "
+                        + socket.getRemoteSocketAddress());
+                socket.close();
+                continue;
+            }
+            new Thread(() -> {
+                try {
+                    atender(socket); // uma thread por cliente
+                } finally {
+                    vagas.release(); // liberta o lugar quando a ligacao termina
+                }
+            }).start();
         }
     }
+
+    /*
+     A4: le uma trama com tempos limite.
+      - A espera pelo INICIO da trama so tem limite se a ligacao ainda nao se
+        autenticou: um cliente legitimo autentica-se logo ao arrancar; quem fica
+        parado sem se autenticar esta so a ocupar um lugar.
+        Depois de autenticado, o cliente pode ficar parado o tempo que quiser
+        (esta a espera de mensagens).
+      - Depois do 1.o byte, o RESTO da trama tem de chegar em TEMPO_TRAMA_MS.
+        Sem isto, um atacante enviava meia trama e prendia a thread para sempre.
+     Faz a mesma validacao de tamanho que Trama.ler.
+     */
+    private static Trama lerTrama(Socket socket, DataInputStream in, boolean autenticado) throws IOException {
+        socket.setSoTimeout(autenticado ? 0 : (int) TEMPO_AUTENTICACAO_MS); // 0 = sem limite
+        byte tipo = in.readByte();
+
+        socket.setSoTimeout((int) TEMPO_TRAMA_MS);
+        int tamanho = in.readInt();
+        if (tamanho < 0 || tamanho > Trama.MAX_CORPO) {
+            throw new IOException("Tamanho invalido: " + tamanho);
+        }
+        byte[] corpo = new byte[tamanho];
+        in.readFully(corpo);
+        return new Trama(tipo, corpo);
+    }    
 
     private static void atender(Socket socket) {
         String origem = socket.getRemoteSocketAddress().toString();
@@ -64,7 +114,7 @@ public class RelayMain {
 
             lig = new Ligacao(out);
             while (true) {
-                Trama trama = Trama.ler(in);
+                Trama trama = lerTrama(socket, in, meuNome != null); // A4: com tempos limite
                 switch (trama.tipo) {
                     case Tipos.REGISTO -> registar(trama.corpo, lig);
                     case Tipos.PROCURAR -> procurar(trama.corpo, lig);
@@ -85,6 +135,9 @@ public class RelayMain {
                     default -> lig.erro("Tipo de trama desconhecido: " + trama.tipo);                                        
                 }
             }
+        } catch (SocketTimeoutException e) {
+            // A4: trama incompleta ou ligacao parada sem se autenticar
+            System.out.println("Tempo limite excedido: " + origem);
         } catch (IOException e) {
             // normal quando o cliente se desliga (ou envia uma trama mal formada)
         } finally {

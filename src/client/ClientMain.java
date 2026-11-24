@@ -154,7 +154,7 @@ public class ClientMain {
         Trama r = pedido(Tipos.REGISTO, corpo);
         if (r.tipo == Tipos.REGISTO_OK) {
             System.out.println("Registado como '" + nome + "'.");
-            System.out.println("Comandos: procurar <nome> | verificar <nome> | enviar <nome> <texto> | sair");
+            System.out.println("Comandos: procurar <nome> | verificar <nome> | meucodigo | enviar <nome> <texto> | levantar | sair");
             return true;
         }
         System.out.println("Registo recusado: " + texto(r));
@@ -263,6 +263,15 @@ public class ClientMain {
                         Registo reg = obterContacto(partes[1]);
                         String codigo = gestorContactos.obterCodigoVerificacao(reg.nome);
                         System.out.println("Codigo de verificacao de '" + reg.nome + "': " + codigo);
+                        System.out.println("Liga a '" + reg.nome + "' e compara com o que essa pessoa ve ao correr 'meucodigo'. "
+                                + "Se forem diferentes, NAO confies neste contacto.");
+                    }
+                    case "meucodigo" -> {
+                        // Calculado a partir das MINHAS chaves locais (nao pergunta nada ao relay).
+                        Registo proprio = Registo.ler(Registo.criar(nome, parAssinatura, parAcordo));
+                        String codigo = Contactos.gerarCodigoVerificacao(Contactos.calcularImpressaoDigital(proprio));
+                        System.out.println("O teu codigo de verificacao ('" + nome + "'): " + codigo);
+                        System.out.println("Le-o por telefone ao teu contacto: essa pessoa deve ver o mesmo com 'verificar " + nome + "'.");
                     }
                     case "enviar" -> {
                         if (partes.length < 3) { System.out.println("Uso: enviar <nome> <texto>"); break; }
@@ -271,7 +280,7 @@ public class ClientMain {
                     case "levantar" -> levantar(); // modulo C (A3)                    
                     case "sair" -> { return; }
                     case "" -> { }
-                    default -> System.out.println("Comandos: procurar <nome> | verificar <nome> | enviar <nome> <texto> | sair");
+                    default -> System.out.println("Comandos: procurar <nome> | verificar <nome> | meucodigo | enviar <nome> <texto> | levantar | sair");
                 }
             } catch (Exception e) {
                 System.out.println("Erro: " + e.getMessage());

@@ -28,6 +28,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
+
 //Threads:
 //main: le comandos do teclado e faz pedidos ao relay (um de cada vez);
 //leitora: le TODAS as tramas que chegam do relay. As respostas a pedidos
@@ -238,6 +239,14 @@ public class ClientMain {
     // ---------- interface de texto ----------
 
     private void ciclo() throws IOException {
+        // Modulo C (A3): antes de tudo, provar ao relay quem somos e levantar as mensagens guardadas.
+        // Sem isto o relay nao entrega mensagens a esta ligacao nem aceita ENVIAR.
+        try {
+            levantar();
+        } catch (Exception e) {
+            System.out.println("Levantamento recusado: " + e.getMessage());
+            return;
+        }
         BufferedReader teclado = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
         String linha;
         while ((linha = teclado.readLine()) != null) {
@@ -259,6 +268,7 @@ public class ClientMain {
                         if (partes.length < 3) { System.out.println("Uso: enviar <nome> <texto>"); break; }
                         enviar(partes[1], partes[2]);
                     }
+                    case "levantar" -> levantar(); // modulo C (A3)                    
                     case "sair" -> { return; }
                     case "" -> { }
                     default -> System.out.println("Comandos: procurar <nome> | verificar <nome> | enviar <nome> <texto> | sair");
@@ -267,6 +277,12 @@ public class ClientMain {
                 System.out.println("Erro: " + e.getMessage());
             }
         }
+    }
+
+    // Modulo C (A3): desafio-resposta com o relay e levantamento das mensagens pendentes.
+    private void levantar() throws Exception {
+        int n = Levantar.executar(this::pedido, nome, parAssinatura.getPrivate());
+        System.out.println("Autenticado no relay. Mensagens pendentes levantadas: " + n);
     }
 
     private static String texto(Trama t) {

@@ -10,4 +10,9 @@ public class Tipos {
     public static final byte ENVIAR_OK = 8;      // relay -> cliente: "entregue" ou "guardada" (UTF-8)
     public static final byte ENTREGA = 9;        // relay -> cliente: envelope cifrado (o relay nao o consegue ler)
     public static final byte ERRO = 127;         // mensagem de erro (UTF-8)
+    public static final byte LEVANTAR = 10;      // cliente -> relay: nome (UTF-8)
+    public static final byte DESAFIO = 11;       // relay -> cliente: nonce aleatorio (32 bytes)
+    public static final byte RESPOSTA = 12;      // cliente -> relay: [len][nonce] [len][assinatura]
+    public static final byte LEVANTAR_OK = 13;   // relay -> cliente: int com o numero de pendentes entregues
+                                                 // (as pendentes seguem antes, como tramas ENTREGA)
 }

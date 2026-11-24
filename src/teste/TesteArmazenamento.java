@@ -1,5 +1,6 @@
 package teste;
 
+import client.Levantar;
 import common.Bytes;
 import common.Chaves;
 import common.Mensagem;
@@ -66,9 +67,11 @@ public class TesteArmazenamento {
         // O bruno regista-se e fica ligado
         Cliente bruno = new Cliente(porto);
         bruno.pedido(Tipos.REGISTO, Registo.criar("bruno", brunoEd, brunoX));
+        Levantar.executar(bruno::pedido, "bruno", brunoEd.getPrivate());
 
         try (Cliente ana = new Cliente(porto)) {
             ana.pedido(Tipos.REGISTO, Registo.criar("ana", anaEd, anaX));
+            Levantar.executar(ana::pedido, "ana", anaEd.getPrivate());
             Registo regBruno = Registo.ler(ana.pedido(Tipos.PROCURAR, "bruno".getBytes(StandardCharsets.UTF_8)).corpo);
 
             // 1. Bruno ligado: entregue em direto

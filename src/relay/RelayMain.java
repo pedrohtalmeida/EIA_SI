@@ -1,6 +1,8 @@
 package relay;
 
+
 import common.Bytes;
+import common.Levantamento;
 import common.Registo;
 import common.Tipos;
 import common.Trama;
@@ -10,9 +12,15 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
+
+
 
 /*
  * Relay: regista utilizadores, responde a pedidos de descoberta e reencaminha
@@ -28,6 +36,18 @@ public class RelayMain {
     // Ligacao ativa de cada utilizador + mensagens pendentes (armazenamento diferido).
     private static final Pendentes pendentes = new Pendentes();
 
+    
+    // Modulo C: desafios do levantamento, validos durante 30 segundos.
+    public static final long VALIDADE_DESAFIO_MS = 30_000;
+    private static final Desafios desafios = new Desafios(VALIDADE_DESAFIO_MS);
+
+    // A4 - Robustez (disponibilidade). Os valores podem ser mudados com -D na linha
+    // de comandos (ex.: java -Drelay.maxLigacoes=50 ...); os testes usam valores pequenos.
+    public static final int MAX_LIGACOES = Integer.getInteger("relay.maxLigacoes", 100);
+    public static final long TEMPO_TRAMA_MS = Long.getLong("relay.tempoTramaMs", 10_000);
+    public static final long TEMPO_AUTENTICACAO_MS = Long.getLong("relay.tempoAutenticacaoMs", 30_000);
+    private static final Semaphore vagas = new Semaphore(MAX_LIGACOES);
+
    public static void main(String[] args) throws IOException {
         int porto = args.length > 0 ? Integer.parseInt(args[0]) : PORTO_PREDEFINIDO;
         try (ServerSocket servidor = new ServerSocket(porto)) {
@@ -35,13 +55,52 @@ public class RelayMain {
             servir(servidor);
         }
     }
+   
     // Separado do main para os testes poderem arrancar um relay num porto livre.
+    // A4: no maximo MAX_LIGACOES ligacoes ao mesmo tempo; as que passam do limite sao fechadas logo.
     public static void servir(ServerSocket servidor) throws IOException {
         while (true) {
             Socket socket = servidor.accept();
-            new Thread(() -> atender(socket)).start(); // uma thread por cliente
+            if (!vagas.tryAcquire()) {
+                System.out.println("Ligacao recusada (limite de " + MAX_LIGACOES + " ligacoes): "
+                        + socket.getRemoteSocketAddress());
+                socket.close();
+                continue;
+            }
+            new Thread(() -> {
+                try {
+                    atender(socket); // uma thread por cliente
+                } finally {
+                    vagas.release(); // liberta o lugar quando a ligacao termina
+                }
+            }).start();
         }
     }
+
+    /*
+     A4: le uma trama com tempos limite.
+      - A espera pelo INICIO da trama so tem limite se a ligacao ainda nao se
+        autenticou: um cliente legitimo autentica-se logo ao arrancar; quem fica
+        parado sem se autenticar esta so a ocupar um lugar.
+        Depois de autenticado, o cliente pode ficar parado o tempo que quiser
+        (esta a espera de mensagens).
+      - Depois do 1.o byte, o RESTO da trama tem de chegar em TEMPO_TRAMA_MS.
+        Sem isto, um atacante enviava meia trama e prendia a thread para sempre.
+     Faz a mesma validacao de tamanho que Trama.ler.
+     */
+    private static Trama lerTrama(Socket socket, DataInputStream in, boolean autenticado) throws IOException {
+        socket.setSoTimeout(autenticado ? 0 : (int) TEMPO_AUTENTICACAO_MS); // 0 = sem limite
+        byte tipo = in.readByte();
+
+        socket.setSoTimeout((int) TEMPO_TRAMA_MS);
+        int tamanho = in.readInt();
+        if (tamanho < 0 || tamanho > Trama.MAX_CORPO) {
+            throw new IOException("Tamanho invalido: " + tamanho);
+        }
+        byte[] corpo = new byte[tamanho];
+        in.readFully(corpo);
+        return new Trama(tipo, corpo);
+    }    
 
     private static void atender(Socket socket) {
         String origem = socket.getRemoteSocketAddress().toString();
@@ -55,44 +114,54 @@ public class RelayMain {
 
             lig = new Ligacao(out);
             while (true) {
-                Trama trama = Trama.ler(in);
+                Trama trama = lerTrama(socket, in, meuNome != null); // A4: com tempos limite
                 switch (trama.tipo) {
-                    case Tipos.REGISTO -> {
-                        if (meuNome != null) {
-                            lig.erro("Esta ligacao ja esta registada como " + meuNome);
-                        } else {
-                            meuNome = registar(trama.corpo, lig);
+                    case Tipos.REGISTO -> registar(trama.corpo, lig);
+                    case Tipos.PROCURAR -> procurar(trama.corpo, lig);
+                    case Tipos.LEVANTAR -> pedirDesafio(trama.corpo, lig, meuNome);
+                    case Tipos.RESPOSTA -> {
+                        String nome = responderDesafio(trama.corpo, lig);
+                        if (nome != null) {
+                            meuNome = nome; // so agora a ligacao fica associada ao nome
                         }
                     }
-                    case Tipos.PROCURAR -> procurar(trama.corpo, lig);
                     case Tipos.ENVIAR -> {
                         if (meuNome == null) {
-                            lig.erro("Tem de se registar primeiro");
+                            lig.erro("Tem de se autenticar primeiro (levantar)");
                         } else {
                             reencaminhar(meuNome, trama.corpo, lig);
                         }
                     }
-                    default -> lig.erro("Tipo de trama desconhecido: " + trama.tipo);
+                    default -> lig.erro("Tipo de trama desconhecido: " + trama.tipo);                                        
                 }
             }
+        } catch (SocketTimeoutException e) {
+            // A4: trama incompleta ou ligacao parada sem se autenticar
+            System.out.println("Tempo limite excedido: " + origem);
         } catch (IOException e) {
             // normal quando o cliente se desliga (ou envia uma trama mal formada)
         } finally {
             if (meuNome != null) {
                 pendentes.desligar(meuNome, lig); // a partir daqui, as mensagens para ele sao guardadas
             }
+            if (lig != null) {
+                desafios.esquecer(lig); // um desafio por responder desta ligacao deixa de valer
+            }            
             System.out.println("Cliente desligado: " + origem + (meuNome != null ? " (" + meuNome + ")" : ""));
         }
     }
 
-    // Devolve o nome registado, ou null se o registo foi recusado.
-    private static String registar(byte[] corpo, Ligacao lig) throws IOException {
+
+    // O registo so publica as chaves publicas: NAO associa a ligacao ao nome.
+    // A trama de registo nao tem nada de secreto e qualquer pessoa a podia repetir;
+    // a ligacao so fica associada ao nome depois do desafio-resposta (modulo C).
+    private static void registar(byte[] corpo, Ligacao lig) throws IOException {
         Registo novo;
         try {
             novo = Registo.ler(corpo); // valida o formato e verifica a assinatura
         } catch (Exception e) {
             lig.erro("Registo invalido: " + e.getMessage());
-            return null;
+            return;
         }
 
         // Verificar-e-inserir numa so operacao atomica: evita que duas threads
@@ -108,13 +177,46 @@ public class RelayMain {
         });
         if (recusado[0]) {
             lig.erro("Nome ja registado com outra chave");
-            return null;
+            return;
         }
 
-        pendentes.ligar(novo.nome, lig); // se ja estava ligado noutra ligacao, esta passa a ser a ativa
         System.out.println("Registado: " + novo.nome);
         lig.enviar(Tipos.REGISTO_OK, new byte[0]);
-        return novo.nome;
+    }
+    
+
+    // modulo C: levantamento por desafio-resposta 
+    
+    private static void pedirDesafio(byte[] corpo, Ligacao lig, String autenticado) throws IOException {
+        String nome = new String(corpo, StandardCharsets.UTF_8);
+        if (autenticado != null && !autenticado.equals(nome)) {
+            lig.erro("Esta ligacao ja esta autenticada como " + autenticado);
+            return;
+        }
+        if (!utilizadores.containsKey(nome)) {
+            lig.erro("Utilizador desconhecido: " + nome);
+            return;
+        }
+        lig.enviar(Tipos.DESAFIO, desafios.novo(lig, nome));
+    }
+
+    // Devolve o nome autenticado, ou null se a resposta foi recusada.
+    private static String responderDesafio(byte[] corpo, Ligacao lig) throws IOException {
+        String nome;
+        try {
+            byte[][] r = Levantamento.lerResposta(corpo);
+            nome = desafios.verificar(lig, r[0], r[1], utilizadores::get);
+        } catch (IOException | GeneralSecurityException e) {
+            desafios.esquecer(lig); // uma resposta mal formada tambem gasta o desafio
+            System.out.println("Levantamento recusado: " + e.getMessage());
+            lig.erro("Levantamento recusado: " + e.getMessage());
+            return null;
+        }
+        // Provado quem e: entrega as pendentes e passa a receber as novas em direto.
+        int entregues = pendentes.ligarEEntregar(nome, lig);
+        System.out.println("Autenticado: " + nome + " (" + entregues + " pendentes entregues)");
+        lig.enviar(Tipos.LEVANTAR_OK, ByteBuffer.allocate(4).putInt(entregues).array());
+        return nome;
     }
 
     private static void procurar(byte[] corpo, Ligacao lig) throws IOException {
